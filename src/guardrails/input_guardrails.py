@@ -11,16 +11,22 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
 from google.adk.plugins import base_plugin
 from google.adk.agents.invocation_context import InvocationContext
 
+from agents.security_boundary import (
+    contains_instruction_override,
+    normalize_for_security,
+)
 from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+MAX_INPUT_CHARS = 8_000
 
 
 # ============================================================
@@ -51,15 +57,37 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+    text = normalize_for_security(user_input)
+
+    # Xóa các ký tự Unicode vô hình thường dùng để né regex.
+    text = text.translate(
+        str.maketrans("", "", "\u200b\u200c\u200d\ufeff\u2060")
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+
+    injection_patterns = [
+        r"ignore\s+(?:all\s+)?(?:previous|above|prior)?\s*instructions?",
+        r"disregard\s+(?:all\s+)?(?:previous|above|prior)?\s*(?:instructions?|rules?|directives?)",
+        r"forget\s+(?:all\s+)?(?:your\s+)?(?:instructions?|rules?|prompt)",
+        r"override\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions?)",
+        r"\byou\s+are\s+now\b",
+        r"\bsystem\s+prompt\b",
+        r"\breveal\b.*\b(?:instructions?|prompt|password|secret|api\s*key)\b",
+        r"\bshow\s+me\b.*\b(?:instructions?|prompt|password|secret|api\s*key)\b",
+        r"\bpretend\s+(?:you\s+are|to\s+be)\b",
+        r"\bact\s+as\s+(?:a\s+|an\s+)?(?:unrestricted|jailbroken|evil)\b",
+        r"\bDAN\b",
+        r"bỏ\s+qua\s+(?:mọi\s+)?hướng\s+dẫn",
+        r"tiết\s+lộ\s+(?:mật\s+khẩu|api\s*key|system\s*prompt)",
     ]
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    if contains_instruction_override(text):
+        return "BLOCK"
+
+    for pattern in injection_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
             return "BLOCK"
+
     return "ALLOW"
 
 
@@ -84,14 +112,28 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = unicodedata.normalize("NFKC", user_input or "").casefold()
+    input_lower = "".join(
+        character
+        for character in unicodedata.normalize("NFD", input_lower)
+        if unicodedata.category(character) != "Mn"
+    ).replace("đ", "d")
 
     # TODO: Implement logic:
     # 1. If input contains any blocked topic -> return "BLOCK"
     # 2. If input doesn't contain any allowed topic -> return "BLOCK"
     # 3. Otherwise -> return "ALLOW"
 
-    pass  # Replace with your implementation
+    blocked_topics = tuple(BLOCKED_TOPICS) + (
+        "danh cap", "trom", "vu khi", "ma tuy", "co bac", "bom", "giet",
+    )
+    if any(topic.casefold() in input_lower for topic in blocked_topics):
+        return "BLOCK"
+
+    if not any(topic.casefold() in input_lower for topic in ALLOWED_TOPICS):
+        return "BLOCK"
+
+    return "ALLOW"
 
 
 # ============================================================
@@ -129,6 +171,16 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
             parts=[types.Part.from_text(text=message)],
         )
 
+    def _is_vietnamese(self, text: str) -> bool:
+        """Recognize Vietnamese input so block messages use the same language."""
+        normalized = unicodedata.normalize("NFC", text or "").casefold()
+        vietnamese_markers = (
+            "bỏ qua", "hướng dẫn", "tiết lộ", "mật khẩu", "ngân hàng",
+            "tài khoản", "giao dịch", "chuyển tiền", "lãi suất", "tiết kiệm",
+            "số dư", "thẻ tín dụng", "vay", "tóm tắt", "hãy", "tôi",
+        )
+        return any(marker in normalized for marker in vietnamese_markers)
+
     async def on_user_message_callback(
         self,
         *,
@@ -144,6 +196,16 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
+        if len(text) > MAX_INPUT_CHARS:
+            self.blocked_count += 1
+            if self._is_vietnamese(text):
+                return self._block_response(
+                    "Yêu cầu quá dài. Vui lòng rút gọn câu hỏi ngân hàng của bạn."
+                )
+            return self._block_response(
+                "The request is too long. Please shorten your banking question."
+            )
+
         # TODO: Implement logic:
         # 1. Call detect_injection(text)
         #    - If "BLOCK": increment blocked_count, return self._block_response("...")
@@ -151,7 +213,31 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         #    - If "BLOCK": increment blocked_count, return self._block_response("...")
         # 3. If both return "ALLOW": return None (let message through)
 
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            if self._is_vietnamese(text):
+                return self._block_response(
+                    "Tôi không thể xử lý yêu cầu đó. "
+                    "Vui lòng đặt câu hỏi hợp lệ về dịch vụ ngân hàng VinBank."
+                )
+            return self._block_response(
+                "I cannot process that request. "
+                "Please ask a legitimate VinBank banking question."
+            )
+
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            if self._is_vietnamese(text):
+                return self._block_response(
+                    "Tôi là trợ lý VinBank và chỉ có thể hỗ trợ "
+                    "các câu hỏi liên quan đến ngân hàng."
+                )
+            return self._block_response(
+                "I'm a VinBank assistant and can only help "
+                "with banking-related questions."
+            )
+
+        return None
 
 
 # ============================================================

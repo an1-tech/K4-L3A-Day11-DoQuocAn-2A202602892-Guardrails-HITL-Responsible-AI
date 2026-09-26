@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from agents.security_boundary import contains_secret
 from core.utils import chat_with_agent
 
 
@@ -47,6 +48,19 @@ def content_filter(response: str) -> dict:
         # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
         # - API key pattern: r"sk-[a-zA-Z0-9-]+"
         # - Password pattern: r"password\s*[:=]\s*\S+"
+        "phone": r"(?<!\d)(?:\+?84|0)(?:[\s.()-]?\d){9,10}(?!\d)",
+        "email": r"\b[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}\b",
+        "national_id": (
+            r"(?<!\d)(?:\d[\s.-]?){11}\d(?![\s.-]?\d)|"
+            r"(?<!\d)(?:\d[\s.-]?){8}\d(?![\s.-]?\d)"
+        ),
+        "api_key": r"\b(?:sk|rk|pk|api)[-_][a-zA-Z0-9_-]{8,}\b",
+        "password": (
+            r"\b(?:password|passcode|mật\s*khẩu)\s*"
+            r"(?:is|là|[:=])\s*\S+"
+        ),
+        "internal_db": r"\b[\w.-]+\.internal(?::\d+)?\b",
+        "bearer_token": r"\bBearer\s+[a-zA-Z0-9._~-]{12,}\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -54,6 +68,16 @@ def content_filter(response: str) -> dict:
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Known protected values may be spaced, reversed, encoded or use spoken
+    # punctuation. In that case span-level substitution is unreliable, so fail
+    # closed and replace the complete response.
+    if contains_secret(response):
+        if not any(issue.startswith("protected_secret:") for issue in issues):
+            issues.append("protected_secret: 1 found")
+        redacted = (
+            "[REDACTED] I cannot share protected customer or internal system information."
+        )
 
     return {
         "safe": len(issues) == 0,
@@ -181,7 +205,37 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         #    - Increment self.blocked_count
         # 3. Return llm_response (possibly modified)
 
-        return llm_response  # TODO: modify if needed
+        filter_result = content_filter(response_text)
+
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_text(
+                        text=filter_result["redacted"]
+                    )
+                ],
+            )
+
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I cannot provide that response. "
+                                "Please ask a safe VinBank banking question."
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================

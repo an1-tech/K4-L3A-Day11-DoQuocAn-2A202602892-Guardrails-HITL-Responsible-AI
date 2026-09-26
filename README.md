@@ -86,6 +86,25 @@ User → Rate Limiter → Input Guardrails → LLM → Output Guardrails
                                               → Audit / Monitoring → Reply / Egress check
 ```
 
+## UI demo Blue Team vs Prompt Injection
+
+Chạy từ thư mục gốc của repo:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+.\.venv\Scripts\python.exe scripts\demo_ui.py
+```
+
+Trình duyệt sẽ tự mở tại `http://127.0.0.1:7860`. UI gọi trực tiếp Blue
+Agent và các lớp bảo vệ thật của Checkpoint 2–3. Nút **Reset phiên demo**
+xóa bộ đếm và cửa sổ rate limit trước vòng trình diễn mới.
+
+Nếu không muốn tự mở trình duyệt:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\demo_ui.py --no-browser
+```
+
 | Đã có sẵn | Bạn tự làm | Hệ thống sinh ra |
 |-----------|------------|------------------|
 | Starter `src/guardrails/`, `src/assignment/`, `src/attacks/` | Theo Checkpoint 2–4 | `outputs/results.json`, `attack_results.json`, … |
